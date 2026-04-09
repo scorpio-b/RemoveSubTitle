@@ -1,0 +1,6 @@
+build/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+!tests/data/359.mp4
