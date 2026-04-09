@@ -83,8 +83,8 @@ cv::Mat ExtractFineTextMask(
     }
 
     const cv::Rect clipped = band_box & cv::Rect(0, 0, gray.cols, gray.rows);
-    const int focus_y = clipped.y + clipped.height / 5;
-    const int focus_height = std::max(12, clipped.height * 3 / 5);
+    const int focus_y = clipped.y + clipped.height / 10;
+    const int focus_height = std::max(10, clipped.height * 9 / 20);
     const cv::Rect focus_rect(
         clipped.x,
         focus_y,
@@ -163,6 +163,14 @@ cv::Mat ExtractFineTextMask(
         return fine_mask;
     }
 
+    std::sort(
+        accepted_components.begin(),
+        accepted_components.end(),
+        [](const AcceptedComponent& lhs, const AcceptedComponent& rhs) {
+            return lhs.box.x < rhs.box.x;
+        }
+    );
+
     int median_center_y = 0;
     std::vector<int> centers;
     centers.reserve(accepted_components.size());
@@ -172,12 +180,43 @@ cv::Mat ExtractFineTextMask(
     std::sort(centers.begin(), centers.end());
     median_center_y = centers[centers.size() / 2];
 
+    std::vector<int> heights;
+    heights.reserve(accepted_components.size());
+    for (const AcceptedComponent& component : accepted_components) {
+        heights.push_back(component.box.height);
+    }
+    std::sort(heights.begin(), heights.end());
+    const int median_height = heights[heights.size() / 2];
+
+    std::vector<AcceptedComponent> grouped_components;
+    grouped_components.reserve(accepted_components.size());
+    int previous_right = -1;
     for (const AcceptedComponent& component : accepted_components) {
         const int center_y = component.box.y + component.box.height / 2;
-        if (std::abs(center_y - median_center_y) > 10) {
+        if (std::abs(center_y - median_center_y) > 8) {
             continue;
         }
 
+        if (std::abs(component.box.height - median_height) > 6) {
+            continue;
+        }
+
+        if (previous_right >= 0) {
+            const int gap = component.box.x - previous_right;
+            if (gap > median_height * 2) {
+                continue;
+            }
+        }
+
+        grouped_components.push_back(component);
+        previous_right = component.box.x + component.box.width;
+    }
+
+    if (grouped_components.size() < 2) {
+        return fine_mask;
+    }
+
+    for (const AcceptedComponent& component : grouped_components) {
         cv::Mat component_mask = labels == component.label;
         filtered_mask.setTo(255, component_mask);
     }
