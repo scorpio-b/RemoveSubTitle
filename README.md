@@ -22,6 +22,16 @@ Optional parameters:
 remove_subtitle <input_video> <output_video> [x y width height temporal_window patch_radius]
 ```
 
+## Tests
+
+Tests are disabled by default so IDE configuration does not depend on downloading GoogleTest.
+
+```bash
+cmake -S . -B build -DREMOVE_SUBTITLE_BUILD_TESTS=ON
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+```
+
 ## Test Asset
 
 The repository keeps one local test video at `tests/data/359.mp4`.
