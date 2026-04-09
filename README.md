@@ -1,6 +1,7 @@
 # RemoveSubTitle
 
 C++17 experiment for removing hardcoded subtitles from video using temporal restoration.
+去掉即梦生成的 mp4 格式视频里的硬字幕。
 
 ## Build
 
