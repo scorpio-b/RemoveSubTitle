@@ -105,18 +105,18 @@ std::vector<cv::Mat> StabilizeMasksTemporally(
         }
 
         if (supporting_neighbors == 0) {
-            stabilized.setTo(0);
             stabilized_masks.push_back(stabilized);
             continue;
         }
 
         cv::Mat roi_support = support(roi_rect).clone();
-        cv::Mat dilate_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 5));
+        cv::Mat dilate_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 3));
         cv::dilate(roi_support, roi_support, dilate_kernel, cv::Point(-1, -1), 1);
 
         cv::Mat roi_current = stabilized(roi_rect).clone();
-        cv::bitwise_and(roi_current, roi_support, roi_current);
-        stabilized.setTo(0);
+        cv::Mat roi_supported;
+        cv::bitwise_and(roi_current, roi_support, roi_supported);
+        cv::bitwise_or(roi_current, roi_supported, roi_current);
         roi_current.copyTo(stabilized(roi_rect));
 
         stabilized_masks.push_back(stabilized);
@@ -202,9 +202,13 @@ int ProcessVideo(const Options& options) {
                 cv::rectangle(overlay, box, cv::Scalar(0, 255, 0), 2);
             }
 
+            cv::Mat red_fill = overlay.clone();
+            red_fill.setTo(cv::Scalar(0, 0, 255), masks[index]);
+            cv::addWeighted(red_fill, 0.35, overlay, 0.65, 0.0, overlay);
+
             std::vector<std::vector<cv::Point>> contours;
             cv::findContours(masks[index], contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-            cv::drawContours(overlay, contours, -1, cv::Scalar(0, 0, 255), 1);
+            cv::drawContours(overlay, contours, -1, cv::Scalar(0, 0, 255), 2);
 
             std::ostringstream name;
             name << "mask_" << std::setw(4) << std::setfill('0') << index << ".jpg";
