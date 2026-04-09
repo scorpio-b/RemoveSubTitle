@@ -1,104 +1,134 @@
 #include "remove_subtitle/subtitle_detector.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <memory>
+#include <mutex>
+
+#include <tesseract/baseapi.h>
 
 namespace remove_subtitle {
 
 namespace {
 
-std::vector<cv::Rect> MergeNearbyBoxes(const std::vector<cv::Rect>& input_boxes) {
-    std::vector<cv::Rect> merged = input_boxes;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (std::size_t i = 0; i < merged.size() && !changed; ++i) {
-            for (std::size_t j = i + 1; j < merged.size(); ++j) {
-                const cv::Rect inflated_i = merged[i] + cv::Size(18, 12);
-                const cv::Rect inflated_j = merged[j] + cv::Size(18, 12);
-                if ((inflated_i & inflated_j).area() == 0) {
-                    continue;
-                }
-
-                merged[i] |= merged[j];
-                merged.erase(merged.begin() + static_cast<long>(j));
-                changed = true;
-                break;
-            }
+class OcrLineFilter {
+public:
+    OcrLineFilter() {
+        if (api_.Init(nullptr, "eng")) {
+            enabled_ = false;
+            return;
         }
-    }
-    return merged;
-}
-
-std::vector<cv::Rect> SelectSubtitleLineBoxes(
-    const std::vector<cv::Rect>& input_boxes,
-    const cv::Size& roi_size
-) {
-    if (input_boxes.empty()) {
-        return {};
+        api_.SetPageSegMode(tesseract::PSM_SINGLE_LINE);
+        enabled_ = true;
     }
 
-    struct Cluster {
-        std::vector<cv::Rect> boxes;
-        int min_center_y = 0;
-        int max_center_y = 0;
-        int total_width = 0;
-    };
+    double TextLikelihood(const cv::Mat& roi) {
+        if (!enabled_ || roi.empty()) {
+            return 0.0;
+        }
 
-    std::vector<Cluster> clusters;
-    for (const cv::Rect& box : input_boxes) {
-        const int center_y = box.y + box.height / 2;
-        bool assigned = false;
-        for (Cluster& cluster : clusters) {
-            if (std::abs(center_y - cluster.min_center_y) <= 18 ||
-                std::abs(center_y - cluster.max_center_y) <= 18) {
-                cluster.boxes.push_back(box);
-                cluster.min_center_y = std::min(cluster.min_center_y, center_y);
-                cluster.max_center_y = std::max(cluster.max_center_y, center_y);
-                cluster.total_width += box.width;
-                assigned = true;
-                break;
+        cv::Mat gray;
+        if (roi.channels() == 3) {
+            cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+        } else {
+            gray = roi;
+        }
+
+        cv::Mat scaled;
+        cv::resize(gray, scaled, cv::Size(), 2.0, 2.0, cv::INTER_CUBIC);
+        cv::Mat binary;
+        cv::threshold(scaled, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        api_.SetImage(binary.data, binary.cols, binary.rows, 1, static_cast<int>(binary.step));
+        api_.Recognize(nullptr);
+        const char* text = api_.GetUTF8Text();
+        const int confidence = api_.MeanTextConf();
+
+        double score = confidence >= 15 ? 1.0 : 0.0;
+        if (text != nullptr) {
+            std::string raw_text(text);
+            delete[] text;
+            const auto it = std::find_if(raw_text.begin(), raw_text.end(), [](unsigned char c) {
+                return !std::isspace(c);
+            });
+            if (it != raw_text.end()) {
+                score += 1.0;
             }
         }
 
-        if (!assigned) {
-            clusters.push_back(Cluster{{box}, center_y, center_y, box.width});
+        api_.Clear();
+        return score;
+    }
+
+private:
+    tesseract::TessBaseAPI api_;
+    std::mutex mutex_;
+    bool enabled_ = false;
+};
+
+cv::Rect ExtractSubtitleBand(const cv::Mat& band_mask) {
+    const int rows = band_mask.rows;
+    const int cols = band_mask.cols;
+
+    int best_start = -1;
+    int best_end = -1;
+    int current_start = -1;
+    int best_score = 0;
+    int current_score = 0;
+
+    for (int y = static_cast<int>(rows * 0.45); y < rows; ++y) {
+        const int row_score = cv::countNonZero(band_mask.row(y));
+        const bool active = row_score >= cols / 14;
+
+        if (active) {
+            if (current_start < 0) {
+                current_start = y;
+                current_score = 0;
+            }
+            current_score += row_score;
+        } else if (current_start >= 0) {
+            const int current_end = y - 1;
+            if (current_score > best_score) {
+                best_score = current_score;
+                best_start = current_start;
+                best_end = current_end;
+            }
+            current_start = -1;
+            current_score = 0;
         }
     }
 
-    auto score_cluster = [&roi_size](const Cluster& cluster) {
-        int mean_center_y = 0;
-        for (const cv::Rect& box : cluster.boxes) {
-            mean_center_y += box.y + box.height / 2;
+    if (current_start >= 0) {
+        const int current_end = rows - 1;
+        if (current_score > best_score) {
+            best_score = current_score;
+            best_start = current_start;
+            best_end = current_end;
         }
-        mean_center_y /= static_cast<int>(cluster.boxes.size());
+    }
 
-        const int distance_to_bottom_band = std::abs(mean_center_y - static_cast<int>(roi_size.height * 0.72));
-        return cluster.total_width - distance_to_bottom_band * 3;
-    };
-
-    auto best_it = std::max_element(
-        clusters.begin(),
-        clusters.end(),
-        [&](const Cluster& lhs, const Cluster& rhs) {
-            return score_cluster(lhs) < score_cluster(rhs);
-        }
-    );
-
-    if (best_it == clusters.end()) {
+    if (best_start < 0 || best_end < 0) {
         return {};
     }
 
-    std::vector<cv::Rect> selected;
-    for (const cv::Rect& box : best_it->boxes) {
-        const int center_y = box.y + box.height / 2;
-        if (center_y < static_cast<int>(roi_size.height * 0.45) ||
-            center_y > static_cast<int>(roi_size.height * 0.92)) {
-            continue;
-        }
-        selected.push_back(box);
+    cv::Mat slice = band_mask.rowRange(best_start, best_end + 1);
+    std::vector<cv::Point> points;
+    cv::findNonZero(slice, points);
+    if (points.empty()) {
+        return {};
     }
 
-    return selected;
+    cv::Rect bounds = cv::boundingRect(points);
+    bounds.y += best_start;
+
+    const int pad_x = 10;
+    const int pad_y = 8;
+    const int x = std::max(0, bounds.x - pad_x);
+    const int y = std::max(0, bounds.y - pad_y);
+    const int width = std::min(cols - x, bounds.width + pad_x * 2);
+    const int height = std::min(rows - y, bounds.height + pad_y * 2);
+    return cv::Rect(x, y, width, height);
 }
 
 }  // namespace
@@ -162,44 +192,15 @@ DetectionResult DetectSubtitleMask(const cv::Mat& frame, const cv::Rect& roi_rec
     cv::Mat dilate_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 3));
     cv::dilate(closed, dilated, dilate_kernel, cv::Point(-1, -1), 1);
 
-    cv::Mat labels;
-    cv::Mat stats;
-    cv::Mat centroids;
-    const int count = cv::connectedComponentsWithStats(dilated, labels, stats, centroids, 8);
+    cv::Mat band_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(31, 3));
+    cv::Mat band_mask;
+    cv::morphologyEx(dilated, band_mask, cv::MORPH_CLOSE, band_kernel);
 
     std::vector<cv::Rect> boxes;
-    for (int label = 1; label < count; ++label) {
-        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
-        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
-        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
-        const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
-        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
-
-        if (area < 24 || width < 8 || height < 8) {
-            continue;
-        }
-
-        if (width > roi_rect.width - 10 || height > roi_rect.height - 10) {
-            continue;
-        }
-
-        if (height > 42) {
-            continue;
-        }
-
-        const int rect_x = std::max(0, left - 6);
-        const int rect_y = std::max(0, top - 6);
-        const cv::Rect component_rect(
-            rect_x,
-            rect_y,
-            std::min(roi.cols - rect_x, width + 12),
-            std::min(roi.rows - rect_y, height + 12)
-        );
-        boxes.push_back(component_rect);
+    const cv::Rect band_box = ExtractSubtitleBand(band_mask);
+    if (!band_box.empty()) {
+        boxes.push_back(band_box);
     }
-
-    boxes = SelectSubtitleLineBoxes(boxes, roi.size());
-    boxes = MergeNearbyBoxes(boxes);
 
     cv::Mat roi_mask(roi.size(), CV_8UC1, cv::Scalar(0));
     for (const cv::Rect& box : boxes) {

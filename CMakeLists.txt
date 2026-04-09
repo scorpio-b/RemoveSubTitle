@@ -7,6 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(REMOVE_SUBTITLE_BUILD_TESTS "Build GoogleTest-based test targets" OFF)
 
 find_package(OpenCV REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(TESSERACT REQUIRED tesseract lept)
 
 set(REMOVE_SUBTITLE_SOURCES
     src/flow_aligner.cpp
@@ -18,8 +20,9 @@ set(REMOVE_SUBTITLE_SOURCES
 )
 
 add_library(remove_subtitle_lib ${REMOVE_SUBTITLE_SOURCES})
-target_include_directories(remove_subtitle_lib PUBLIC include ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(remove_subtitle_lib PUBLIC ${OpenCV_LIBS})
+target_include_directories(remove_subtitle_lib PUBLIC include ${OpenCV_INCLUDE_DIRS} ${TESSERACT_INCLUDE_DIRS})
+target_link_directories(remove_subtitle_lib PUBLIC ${TESSERACT_LIBRARY_DIRS})
+target_link_libraries(remove_subtitle_lib PUBLIC ${OpenCV_LIBS} ${TESSERACT_LIBRARIES})
 
 add_executable(remove_subtitle src/main.cpp)
 target_link_libraries(remove_subtitle PRIVATE remove_subtitle_lib)
