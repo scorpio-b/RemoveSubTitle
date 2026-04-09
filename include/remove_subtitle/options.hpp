@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 namespace remove_subtitle {
@@ -14,6 +15,7 @@ struct Options {
     int height = 220;
     int temporal_window = 12;
     int patch_radius = 2;
+    std::size_t thread_count = 0;
 };
 
 Options ParseArgs(int argc, char** argv);

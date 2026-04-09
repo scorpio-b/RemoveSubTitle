@@ -1,6 +1,7 @@
 #include "remove_subtitle/options.hpp"
 
 #include <iostream>
+#include <thread>
 #include <stdexcept>
 
 namespace remove_subtitle {
@@ -8,11 +9,11 @@ namespace remove_subtitle {
 void PrintUsage() {
     std::cout
         << "Usage: remove_subtitle <input_video> <output_video> "
-        << "[x y width height temporal_window patch_radius [debug_dir]]\n";
+        << "[x y width height temporal_window patch_radius [debug_dir [thread_count]]]\n";
 }
 
 Options ParseArgs(int argc, char** argv) {
-    if (argc != 3 && argc != 9 && argc != 10) {
+    if (argc != 3 && argc != 9 && argc != 10 && argc != 11) {
         PrintUsage();
         throw std::runtime_error("invalid arguments");
     }
@@ -32,6 +33,16 @@ Options ParseArgs(int argc, char** argv) {
 
     if (argc == 10) {
         options.debug_dir = argv[9];
+    }
+
+    if (argc == 11) {
+        options.debug_dir = argv[9];
+        options.thread_count = static_cast<std::size_t>(std::stoul(argv[10]));
+    }
+
+    if (options.thread_count == 0) {
+        const unsigned int hardware_threads = std::thread::hardware_concurrency();
+        options.thread_count = hardware_threads == 0 ? 4 : hardware_threads;
     }
 
     return options;

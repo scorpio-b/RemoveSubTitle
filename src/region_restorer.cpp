@@ -3,9 +3,89 @@
 #include "remove_subtitle/flow_aligner.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace remove_subtitle {
+
+namespace {
+
+struct AlignedReference {
+    int frame_index;
+    int offset;
+    cv::Mat warped_frame;
+};
+
+cv::Rect ExpandRect(const cv::Rect& rect, int padding, const cv::Size& bounds) {
+    const int x = std::max(0, rect.x - padding);
+    const int y = std::max(0, rect.y - padding);
+    const int right = std::min(bounds.width, rect.x + rect.width + padding);
+    const int bottom = std::min(bounds.height, rect.y + rect.height + padding);
+    return cv::Rect(x, y, right - x, bottom - y);
+}
+
+double BorderDifference(
+    const cv::Mat& current,
+    const cv::Mat& reference,
+    const cv::Mat& mask,
+    const cv::Rect& rect
+) {
+    const cv::Rect expanded = ExpandRect(rect, 2, current.size());
+    double total = 0.0;
+    int count = 0;
+
+    for (int y = expanded.y; y < expanded.y + expanded.height; ++y) {
+        for (int x = expanded.x; x < expanded.x + expanded.width; ++x) {
+            const bool inside_rect =
+                x >= rect.x && x < rect.x + rect.width &&
+                y >= rect.y && y < rect.y + rect.height;
+            if (inside_rect) {
+                continue;
+            }
+            if (mask.at<uchar>(y, x) != 0) {
+                continue;
+            }
+
+            const cv::Vec3b current_pixel = current.at<cv::Vec3b>(y, x);
+            const cv::Vec3b reference_pixel = reference.at<cv::Vec3b>(y, x);
+            total += std::abs(current_pixel[0] - reference_pixel[0]) +
+                     std::abs(current_pixel[1] - reference_pixel[1]) +
+                     std::abs(current_pixel[2] - reference_pixel[2]);
+            ++count;
+        }
+    }
+
+    if (count == 0) {
+        return std::numeric_limits<double>::max();
+    }
+
+    return total / static_cast<double>(count);
+}
+
+std::vector<cv::Rect> ExtractMaskedRegions(const cv::Mat& mask) {
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
+
+    std::vector<cv::Rect> regions;
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area < 6) {
+            continue;
+        }
+
+        const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        regions.emplace_back(left, top, width, height);
+    }
+
+    return regions;
+}
+
+}  // namespace
 
 cv::Vec3b SpatialFallbackSample(
     const cv::Mat& frame,
@@ -61,17 +141,9 @@ cv::Mat RestoreFrame(
     cv::Mat restored = frames[index].clone();
     const cv::Mat& current_mask = masks[index];
 
-    std::vector<cv::Point> masked_points;
-    cv::findNonZero(current_mask, masked_points);
-    if (masked_points.empty()) {
+    if (cv::countNonZero(current_mask) == 0) {
         return restored;
     }
-
-    struct AlignedReference {
-        int frame_index;
-        int offset;
-        cv::Mat warped_frame;
-    };
 
     std::vector<AlignedReference> aligned_references;
     aligned_references.reserve(temporal_window * 2);
@@ -87,58 +159,49 @@ cv::Mat RestoreFrame(
         }
     }
 
-    for (const cv::Point& pt : masked_points) {
-        struct Candidate {
-            double score;
-            cv::Vec3b pixel;
-        };
-        std::vector<Candidate> candidates;
+    const std::vector<cv::Rect> regions = ExtractMaskedRegions(current_mask);
+    for (const cv::Rect& region : regions) {
+        const cv::Rect expanded = ExpandRect(region, patch_radius + 2, restored.size());
 
+        double best_score = std::numeric_limits<double>::max();
+        const cv::Mat* best_reference = nullptr;
         for (const AlignedReference& reference : aligned_references) {
-            if (masks[reference.frame_index].at<uchar>(pt) != 0) {
+            const cv::Point center(region.x + region.width / 2, region.y + region.height / 2);
+            if (masks[reference.frame_index].at<uchar>(center) != 0) {
                 continue;
             }
 
             const double score =
-                PatchDifference(frames[index], reference.warped_frame, pt, patch_radius) +
-                reference.offset * 0.35;
-
-            if (score > 28.0) {
-                continue;
+                BorderDifference(frames[index], reference.warped_frame, current_mask, expanded) +
+                reference.offset * 1.25;
+            if (score < best_score) {
+                best_score = score;
+                best_reference = &reference.warped_frame;
             }
-
-            candidates.push_back({score, reference.warped_frame.at<cv::Vec3b>(pt)});
         }
 
-        if (!candidates.empty()) {
-            std::sort(
-                candidates.begin(),
-                candidates.end(),
-                [](const Candidate& lhs, const Candidate& rhs) { return lhs.score < rhs.score; }
-            );
+        if (best_reference != nullptr && best_score < 90.0) {
+            cv::Mat target_roi = restored(expanded);
+            cv::Mat reference_roi = (*best_reference)(expanded);
+            cv::Mat mask_roi = current_mask(expanded);
 
-            const int use_count = std::min<int>(3, candidates.size());
-            cv::Vec3d sum(0.0, 0.0, 0.0);
-            double weight_sum = 0.0;
-            for (int i = 0; i < use_count; ++i) {
-                const double weight = 1.0 / std::max(1.0, candidates[i].score);
-                sum[0] += static_cast<double>(candidates[i].pixel[0]) * weight;
-                sum[1] += static_cast<double>(candidates[i].pixel[1]) * weight;
-                sum[2] += static_cast<double>(candidates[i].pixel[2]) * weight;
-                weight_sum += weight;
-            }
-
-            restored.at<cv::Vec3b>(pt) = cv::Vec3b(
-                cv::saturate_cast<uchar>(sum[0] / weight_sum),
-                cv::saturate_cast<uchar>(sum[1] / weight_sum),
-                cv::saturate_cast<uchar>(sum[2] / weight_sum)
-            );
+            reference_roi.copyTo(target_roi, mask_roi);
             continue;
         }
 
-        restored.at<cv::Vec3b>(pt) = SpatialFallbackSample(restored, current_mask, pt.y, pt.x);
+        for (int y = region.y; y < region.y + region.height; ++y) {
+            for (int x = region.x; x < region.x + region.width; ++x) {
+                if (current_mask.at<uchar>(y, x) == 0) {
+                    continue;
+                }
+                restored.at<cv::Vec3b>(y, x) = SpatialFallbackSample(restored, current_mask, y, x);
+            }
+        }
     }
 
+    cv::Mat blur_source = restored.clone();
+    cv::GaussianBlur(blur_source, blur_source, cv::Size(3, 3), 0.0);
+    blur_source.copyTo(restored, current_mask);
     return restored;
 }
 
