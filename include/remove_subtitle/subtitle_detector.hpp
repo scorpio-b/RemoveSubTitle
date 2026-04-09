@@ -8,6 +8,7 @@ namespace remove_subtitle {
 
 struct DetectionResult {
     cv::Mat mask;
+    cv::Mat band_mask;
     std::vector<cv::Rect> boxes;
     int masked_pixels = 0;
 };

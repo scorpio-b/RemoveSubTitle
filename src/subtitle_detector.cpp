@@ -1,71 +1,10 @@
 #include "remove_subtitle/subtitle_detector.hpp"
 
 #include <algorithm>
-#include <cctype>
-#include <memory>
-#include <mutex>
-
-#include <tesseract/baseapi.h>
 
 namespace remove_subtitle {
 
 namespace {
-
-class OcrLineFilter {
-public:
-    OcrLineFilter() {
-        if (api_.Init(nullptr, "eng")) {
-            enabled_ = false;
-            return;
-        }
-        api_.SetPageSegMode(tesseract::PSM_SINGLE_LINE);
-        enabled_ = true;
-    }
-
-    double TextLikelihood(const cv::Mat& roi) {
-        if (!enabled_ || roi.empty()) {
-            return 0.0;
-        }
-
-        cv::Mat gray;
-        if (roi.channels() == 3) {
-            cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
-        } else {
-            gray = roi;
-        }
-
-        cv::Mat scaled;
-        cv::resize(gray, scaled, cv::Size(), 2.0, 2.0, cv::INTER_CUBIC);
-        cv::Mat binary;
-        cv::threshold(scaled, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        api_.SetImage(binary.data, binary.cols, binary.rows, 1, static_cast<int>(binary.step));
-        api_.Recognize(nullptr);
-        const char* text = api_.GetUTF8Text();
-        const int confidence = api_.MeanTextConf();
-
-        double score = confidence >= 15 ? 1.0 : 0.0;
-        if (text != nullptr) {
-            std::string raw_text(text);
-            delete[] text;
-            const auto it = std::find_if(raw_text.begin(), raw_text.end(), [](unsigned char c) {
-                return !std::isspace(c);
-            });
-            if (it != raw_text.end()) {
-                score += 1.0;
-            }
-        }
-
-        api_.Clear();
-        return score;
-    }
-
-private:
-    tesseract::TessBaseAPI api_;
-    std::mutex mutex_;
-    bool enabled_ = false;
-};
 
 cv::Rect ExtractSubtitleBand(const cv::Mat& band_mask) {
     const int rows = band_mask.rows;
@@ -131,11 +70,131 @@ cv::Rect ExtractSubtitleBand(const cv::Mat& band_mask) {
     return cv::Rect(x, y, width, height);
 }
 
+cv::Mat ExtractFineTextMask(
+    const cv::Mat& gray,
+    const cv::Mat& low_saturation,
+    const cv::Mat& bright_value,
+    const cv::Mat& dark_outline,
+    const cv::Rect& band_box
+) {
+    cv::Mat fine_mask(gray.size(), CV_8UC1, cv::Scalar(0));
+    if (band_box.empty()) {
+        return fine_mask;
+    }
+
+    const cv::Rect clipped = band_box & cv::Rect(0, 0, gray.cols, gray.rows);
+    const int focus_y = clipped.y + clipped.height / 5;
+    const int focus_height = std::max(12, clipped.height * 3 / 5);
+    const cv::Rect focus_rect(
+        clipped.x,
+        focus_y,
+        clipped.width,
+        std::min(gray.rows - focus_y, focus_height)
+    );
+
+    cv::Mat band_gray = gray(focus_rect);
+    cv::Mat band_sat = low_saturation(focus_rect);
+    cv::Mat band_bright = bright_value(focus_rect);
+    cv::Mat band_dark = dark_outline(focus_rect);
+
+    cv::Mat local_binary;
+    cv::adaptiveThreshold(
+        band_gray,
+        local_binary,
+        255,
+        cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv::THRESH_BINARY,
+        21,
+        -4
+    );
+
+    cv::Mat bright_text;
+    cv::bitwise_and(local_binary, band_sat, bright_text);
+    cv::bitwise_and(bright_text, band_bright, bright_text);
+
+    cv::Mat dark_text;
+    cv::bitwise_and(local_binary, band_dark, dark_text);
+
+    cv::Mat text_mask;
+    cv::bitwise_or(bright_text, dark_text, text_mask);
+
+    cv::Mat open_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(text_mask, text_mask, cv::MORPH_OPEN, open_kernel);
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(text_mask, labels, stats, centroids, 8);
+
+    cv::Mat filtered_mask(text_mask.size(), CV_8UC1, cv::Scalar(0));
+    struct AcceptedComponent {
+        int label;
+        cv::Rect box;
+    };
+    std::vector<AcceptedComponent> accepted_components;
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
+
+        if (area < 8 || area > 450) {
+            continue;
+        }
+
+        if (height < 6 || height > focus_rect.height - 2) {
+            continue;
+        }
+
+        if (width < 2 || width > 42) {
+            continue;
+        }
+
+        const double aspect_ratio = static_cast<double>(width) / static_cast<double>(height);
+        if (aspect_ratio > 4.5) {
+            continue;
+        }
+
+        accepted_components.push_back({label, cv::Rect(left, top, width, height)});
+    }
+
+    if (accepted_components.empty()) {
+        return fine_mask;
+    }
+
+    int median_center_y = 0;
+    std::vector<int> centers;
+    centers.reserve(accepted_components.size());
+    for (const AcceptedComponent& component : accepted_components) {
+        centers.push_back(component.box.y + component.box.height / 2);
+    }
+    std::sort(centers.begin(), centers.end());
+    median_center_y = centers[centers.size() / 2];
+
+    for (const AcceptedComponent& component : accepted_components) {
+        const int center_y = component.box.y + component.box.height / 2;
+        if (std::abs(center_y - median_center_y) > 10) {
+            continue;
+        }
+
+        cv::Mat component_mask = labels == component.label;
+        filtered_mask.setTo(255, component_mask);
+    }
+
+    cv::Mat dilate_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::dilate(filtered_mask, filtered_mask, dilate_kernel, cv::Point(-1, -1), 1);
+
+    filtered_mask.copyTo(fine_mask(focus_rect));
+    return fine_mask;
+}
+
 }  // namespace
 
 DetectionResult DetectSubtitleMask(const cv::Mat& frame, const cv::Rect& roi_rect) {
     DetectionResult result;
     result.mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
+    result.band_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
 
     cv::Mat roi = frame(roi_rect);
     cv::Mat gray;
@@ -202,15 +261,25 @@ DetectionResult DetectSubtitleMask(const cv::Mat& frame, const cv::Rect& roi_rec
         boxes.push_back(band_box);
     }
 
-    cv::Mat roi_mask(roi.size(), CV_8UC1, cv::Scalar(0));
     for (const cv::Rect& box : boxes) {
-        cv::rectangle(roi_mask, box, cv::Scalar(255), cv::FILLED);
+        cv::rectangle(result.band_mask(roi_rect), box, cv::Scalar(255), cv::FILLED);
         result.boxes.push_back(cv::Rect(box.x + roi_rect.x, box.y + roi_rect.y, box.width, box.height));
     }
 
-    cv::Mat final_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
-    cv::dilate(roi_mask, roi_mask, final_kernel, cv::Point(-1, -1), 1);
-    roi_mask.copyTo(result.mask(roi_rect));
+    cv::Mat fine_mask = cv::Mat(roi.size(), CV_8UC1, cv::Scalar(0));
+    if (!band_box.empty()) {
+        fine_mask = ExtractFineTextMask(
+            gray,
+            low_saturation,
+            bright_value,
+            dark_outline,
+            band_box
+        );
+    }
+
+    cv::Mat final_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::dilate(fine_mask, fine_mask, final_kernel, cv::Point(-1, -1), 1);
+    fine_mask.copyTo(result.mask(roi_rect));
     result.masked_pixels = cv::countNonZero(result.mask);
     return result;
 }
