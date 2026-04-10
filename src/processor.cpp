@@ -251,6 +251,19 @@ int ProcessVideo(const Options& options) {
                 cv::drawContours(overlay, contours, -1, cv::Scalar(0, 255, 255), 2);
             }
 
+            if (!detections[index].ocr_mask.empty() &&
+                detections[index].ocr_mask.size() == overlay.size() &&
+                detections[index].ocr_mask.type() == CV_8UC1) {
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(
+                    detections[index].ocr_mask,
+                    contours,
+                    cv::RETR_EXTERNAL,
+                    cv::CHAIN_APPROX_SIMPLE
+                );
+                cv::drawContours(overlay, contours, -1, cv::Scalar(255, 0, 0), 2);
+            }
+
             std::ostringstream name;
             name << "mask_" << std::setw(4) << std::setfill('0') << index << ".jpg";
             cv::imwrite((fs::path(options.debug_dir) / name.str()).string(), overlay);

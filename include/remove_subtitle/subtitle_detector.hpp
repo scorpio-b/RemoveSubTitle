@@ -10,6 +10,7 @@ struct DetectionResult {
     cv::Mat mask;
     cv::Mat repair_mask;
     cv::Mat expanded_outline_mask;
+    cv::Mat ocr_mask;
     cv::Mat band_mask;
     std::vector<cv::Rect> boxes;
     int masked_pixels = 0;

@@ -1,5 +1,8 @@
 #include "remove_subtitle/subtitle_detector.hpp"
 
+#include <allheaders.h>
+#include <tesseract/baseapi.h>
+
 #include <algorithm>
 
 namespace remove_subtitle {
@@ -89,6 +92,128 @@ cv::Mat RemoveSmallComponents(const cv::Mat& mask, int min_area) {
         filtered.setTo(255, component_mask);
     }
     return filtered;
+}
+
+cv::Mat BuildColumnSupportMask(const cv::Mat& candidate_mask) {
+    cv::Mat support(candidate_mask.size(), CV_8UC1, cv::Scalar(0));
+    if (candidate_mask.empty()) {
+        return support;
+    }
+
+    std::vector<int> column_scores(candidate_mask.cols, 0);
+    for (int x = 0; x < candidate_mask.cols; ++x) {
+        column_scores[x] = cv::countNonZero(candidate_mask.col(x));
+    }
+
+    const int min_score = std::max(4, candidate_mask.rows / 12);
+    int run_start = -1;
+    for (int x = 0; x < candidate_mask.cols; ++x) {
+        const bool active = column_scores[x] >= min_score;
+        if (active) {
+            if (run_start < 0) {
+                run_start = x;
+            }
+        } else if (run_start >= 0) {
+            const int run_width = x - run_start;
+            if (run_width >= 4) {
+                const int left = std::max(0, run_start - 2);
+                const int right = std::min(candidate_mask.cols, x + 2);
+                cv::rectangle(
+                    support,
+                    cv::Rect(left, 0, right - left, candidate_mask.rows),
+                    cv::Scalar(255),
+                    cv::FILLED
+                );
+            }
+            run_start = -1;
+        }
+    }
+
+    if (run_start >= 0) {
+        const int run_width = candidate_mask.cols - run_start;
+        if (run_width >= 4) {
+            const int left = std::max(0, run_start - 2);
+            cv::rectangle(
+                support,
+                cv::Rect(left, 0, candidate_mask.cols - left, candidate_mask.rows),
+                cv::Scalar(255),
+                cv::FILLED
+            );
+        }
+    }
+
+    return support;
+}
+
+cv::Mat DetectTesseractAssistMask(const cv::Mat& gray) {
+    cv::Mat assist(gray.size(), CV_8UC1, cv::Scalar(0));
+    if (gray.empty()) {
+        return assist;
+    }
+
+    cv::Mat scaled;
+    cv::resize(gray, scaled, cv::Size(), 2.0, 2.0, cv::INTER_CUBIC);
+
+    cv::Mat normalized;
+    cv::normalize(scaled, normalized, 0, 255, cv::NORM_MINMAX);
+
+    cv::Mat binary;
+    cv::threshold(normalized, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    cv::bitwise_not(binary, binary);
+
+    static thread_local tesseract::TessBaseAPI api;
+    static thread_local bool initialized = false;
+    if (!initialized) {
+        if (api.Init(nullptr, "chi_sim+eng", tesseract::OEM_LSTM_ONLY) != 0 &&
+            api.Init(nullptr, "eng", tesseract::OEM_LSTM_ONLY) != 0) {
+            return assist;
+        }
+        api.SetPageSegMode(tesseract::PSM_SINGLE_LINE);
+        initialized = true;
+    }
+
+    api.SetImage(binary.data, binary.cols, binary.rows, 1, static_cast<int>(binary.step));
+    api.Recognize(nullptr);
+
+    Boxa* boxes = api.GetComponentImages(tesseract::RIL_SYMBOL, true, nullptr, nullptr);
+    if (boxes == nullptr) {
+        return assist;
+    }
+
+    const int box_count = boxaGetCount(boxes);
+    for (int i = 0; i < box_count; ++i) {
+        BOX* box = boxaGetBox(boxes, i, L_CLONE);
+        if (box == nullptr) {
+            continue;
+        }
+
+        l_int32 x = 0;
+        l_int32 y = 0;
+        l_int32 width = 0;
+        l_int32 height = 0;
+        boxGetGeometry(box, &x, &y, &width, &height);
+        boxDestroy(&box);
+
+        x /= 2;
+        y /= 2;
+        width = std::max<l_int32>(1, width / 2);
+        height = std::max<l_int32>(1, height / 2);
+
+        if (width < 4 || height < 8 || width > 56 || height > 80) {
+            continue;
+        }
+
+        const cv::Rect rect(x, y, width, height);
+        const cv::Rect clipped = rect & cv::Rect(0, 0, gray.cols, gray.rows);
+        if (clipped.empty()) {
+            continue;
+        }
+
+        cv::rectangle(assist, clipped, cv::Scalar(255), cv::FILLED);
+    }
+
+    boxaDestroy(&boxes);
+    return assist;
 }
 
 cv::Mat FilterCharacterIslands(const cv::Mat& mask) {
@@ -226,9 +351,29 @@ cv::Mat ValidateByDarkRing(
 
         cv::Mat dark_on_ring;
         cv::bitwise_and(outer_ring, dark_outline, dark_on_ring);
+        const int dark_pixels = cv::countNonZero(dark_on_ring);
         const double dark_ratio =
-            static_cast<double>(cv::countNonZero(dark_on_ring)) / static_cast<double>(ring_pixels);
-        if (dark_ratio < 0.10) {
+            static_cast<double>(dark_pixels) / static_cast<double>(ring_pixels);
+
+        cv::Rect box(
+            stats.at<int>(label, cv::CC_STAT_LEFT),
+            stats.at<int>(label, cv::CC_STAT_TOP),
+            width,
+            height
+        );
+        const cv::Rect expanded_box = (
+            box + cv::Size(6, 6) - cv::Point(3, 3)
+        ) & cv::Rect(0, 0, white_core.cols, white_core.rows);
+        cv::Mat local_dark = dark_outline(expanded_box);
+        cv::Mat local_component = component_mask(expanded_box);
+
+        cv::Mat edge_band;
+        cv::dilate(local_component, edge_band, ring_kernel, cv::Point(-1, -1), 1);
+        cv::subtract(edge_band, local_component, edge_band);
+        cv::bitwise_and(edge_band, local_dark, edge_band);
+        const bool has_local_support = cv::countNonZero(edge_band) >= std::max(4, width / 3);
+
+        if (dark_ratio < 0.05 && !has_local_support) {
             continue;
         }
 
@@ -348,10 +493,12 @@ void ExtractCharacterMask(
     const cv::Rect& band_box,
     int repair_expand,
     cv::Mat& outline_mask_out,
-    cv::Mat& repair_mask_out
+    cv::Mat& repair_mask_out,
+    cv::Mat& ocr_mask_out
 ) {
     outline_mask_out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
     repair_mask_out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
+    ocr_mask_out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
     if (band_box.empty()) {
         return;
     }
@@ -384,11 +531,11 @@ void ExtractCharacterMask(
     cv::bitwise_and(soft_white, band_sat, soft_white);
 
     cv::Mat weak_white;
-    cv::inRange(band_gray, 110, 235, weak_white);
+    cv::inRange(band_gray, 102, 238, weak_white);
     cv::bitwise_and(weak_white, band_sat, weak_white);
 
     cv::Mat contrast_white;
-    cv::threshold(local_contrast, contrast_white, 12, 255, cv::THRESH_BINARY);
+    cv::threshold(local_contrast, contrast_white, 10, 255, cv::THRESH_BINARY);
     cv::bitwise_and(contrast_white, band_sat, contrast_white);
 
     cv::Mat dark_outline;
@@ -406,7 +553,7 @@ void ExtractCharacterMask(
     cv::Mat stroke_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
     cv::morphologyEx(strong_white, strong_white, cv::MORPH_CLOSE, stroke_kernel);
     cv::morphologyEx(soft_white, soft_white, cv::MORPH_CLOSE, stroke_kernel);
-    cv::morphologyEx(weak_white, weak_white, cv::MORPH_OPEN, stroke_kernel);
+    cv::morphologyEx(weak_white, weak_white, cv::MORPH_CLOSE, stroke_kernel);
 
     cv::Mat white_core = strong_white.clone();
     cv::bitwise_or(white_core, soft_white, white_core);
@@ -421,7 +568,12 @@ void ExtractCharacterMask(
     cv::bitwise_or(stroke_candidate, strong_white, stroke_candidate);
     cv::Mat weak_candidate;
     cv::bitwise_and(weak_white, contrast_white, weak_candidate);
+    cv::morphologyEx(weak_candidate, weak_candidate, cv::MORPH_CLOSE, stroke_kernel);
     cv::bitwise_or(stroke_candidate, weak_candidate, stroke_candidate);
+    cv::Mat ocr_mask = DetectTesseractAssistMask(band_gray);
+    cv::bitwise_or(stroke_candidate, ocr_mask, stroke_candidate);
+    cv::Mat column_support = BuildColumnSupportMask(stroke_candidate);
+    cv::bitwise_and(stroke_candidate, column_support, stroke_candidate);
     stroke_candidate = RemoveSmallComponents(stroke_candidate, 3);
     cv::Mat grown_white = GrowFromSeed(white_core, stroke_candidate, 3);
     cv::Mat candidate_islands = MergeStrokeClusters(grown_white);
@@ -452,6 +604,7 @@ void ExtractCharacterMask(
     repair_fill.copyTo(repair_mask_out(clipped));
 
     contour_mask.copyTo(outline_mask_out(clipped));
+    ocr_mask.copyTo(ocr_mask_out(clipped));
 }
 
 }  // namespace
@@ -465,6 +618,7 @@ DetectionResult DetectSubtitleMask(
     result.mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
     result.repair_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
     result.expanded_outline_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
+    result.ocr_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
     result.band_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
 
     cv::Mat roi = frame(roi_rect);
@@ -526,6 +680,7 @@ DetectionResult DetectSubtitleMask(
 
     cv::Mat local_outline_mask;
     cv::Mat local_repair_mask;
+    cv::Mat local_ocr_mask;
     ExtractCharacterMask(
         gray,
         low_saturation,
@@ -534,10 +689,12 @@ DetectionResult DetectSubtitleMask(
         band_box,
         repair_expand,
         local_outline_mask,
-        local_repair_mask
+        local_repair_mask,
+        local_ocr_mask
     );
     local_outline_mask.copyTo(result.mask(roi_rect));
     local_repair_mask.copyTo(result.repair_mask(roi_rect));
+    local_ocr_mask.copyTo(result.ocr_mask(roi_rect));
     cv::Mat expanded_outline = ExtractContourMask(local_repair_mask, 10, 2);
     expanded_outline.copyTo(result.expanded_outline_mask(roi_rect));
     result.masked_pixels = cv::countNonZero(result.mask);
