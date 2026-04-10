@@ -9,11 +9,11 @@ namespace remove_subtitle {
 void PrintUsage() {
     std::cout
         << "Usage: remove_subtitle <input_video> <output_video> "
-        << "[x y width height temporal_window patch_radius [debug_dir [thread_count]]]\n";
+        << "[x y width height temporal_window patch_radius [debug_dir [thread_count [repair_expand]]]]\n";
 }
 
 Options ParseArgs(int argc, char** argv) {
-    if (argc != 3 && argc != 9 && argc != 10 && argc != 11) {
+    if (argc != 3 && argc != 9 && argc != 10 && argc != 11 && argc != 12) {
         PrintUsage();
         throw std::runtime_error("invalid arguments");
     }
@@ -31,13 +31,20 @@ Options ParseArgs(int argc, char** argv) {
         options.patch_radius = std::stoi(argv[8]);
     }
 
-    if (argc == 10) {
+    if (argc >= 10) {
         options.debug_dir = argv[9];
     }
 
-    if (argc == 11) {
-        options.debug_dir = argv[9];
+    if (argc >= 11) {
         options.thread_count = static_cast<std::size_t>(std::stoul(argv[10]));
+    }
+
+    if (argc == 12) {
+        options.repair_expand = std::stoi(argv[11]);
+    }
+
+    if (options.repair_expand < 0) {
+        throw std::runtime_error("repair_expand must be non-negative");
     }
 
     if (options.thread_count == 0) {

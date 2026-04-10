@@ -31,6 +31,31 @@ cv::Mat ExtractThinOutline(const cv::Mat& solid_mask) {
     return outline;
 }
 
+cv::Mat ExtractContourMask(
+    const cv::Mat& solid_mask,
+    int min_area,
+    int thickness
+) {
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(solid_mask.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    cv::Mat contour_mask(solid_mask.size(), CV_8UC1, cv::Scalar(0));
+    for (const auto& contour : contours) {
+        const double area = cv::contourArea(contour);
+        if (area < min_area) {
+            continue;
+        }
+        cv::drawContours(
+            contour_mask,
+            std::vector<std::vector<cv::Point>>{contour},
+            -1,
+            cv::Scalar(255),
+            std::max(1, thickness)
+        );
+    }
+    return contour_mask;
+}
+
 cv::Mat GrowFromSeed(
     const cv::Mat& seed_mask,
     const cv::Mat& candidate_mask,
@@ -64,6 +89,191 @@ cv::Mat RemoveSmallComponents(const cv::Mat& mask, int min_area) {
         filtered.setTo(255, component_mask);
     }
     return filtered;
+}
+
+cv::Mat FilterCharacterIslands(const cv::Mat& mask) {
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count =
+        cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
+
+    cv::Mat filtered(mask.size(), CV_8UC1, cv::Scalar(0));
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+
+        if (area < 10) {
+            continue;
+        }
+        if (height < 8 || height > 80) {
+            continue;
+        }
+        if (width < 2 || width > 48) {
+            continue;
+        }
+
+        const double aspect_ratio = static_cast<double>(width) / static_cast<double>(std::max(1, height));
+        if (aspect_ratio > 1.35) {
+            continue;
+        }
+
+        cv::Mat component_mask = labels == label;
+        filtered.setTo(255, component_mask);
+    }
+    return filtered;
+}
+
+cv::Mat MergeStrokeClusters(const cv::Mat& strokes) {
+    cv::Mat merged = strokes.clone();
+    cv::Mat merge_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 7));
+    cv::morphologyEx(merged, merged, cv::MORPH_CLOSE, merge_kernel);
+    merged = FillClosedRegions(merged);
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count =
+        cv::connectedComponentsWithStats(merged, labels, stats, centroids, 8);
+
+    cv::Mat filtered(merged.size(), CV_8UC1, cv::Scalar(0));
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+
+        if (area < 12 || area > 900) {
+            continue;
+        }
+        if (width < 3 || height < 8 || width > 42 || height > 64) {
+            continue;
+        }
+
+        cv::Mat component_mask = labels == label;
+        filtered.setTo(255, component_mask);
+    }
+
+    return filtered;
+}
+
+cv::Mat FilterStrokeLikeComponents(const cv::Mat& mask) {
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count =
+        cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
+
+    cv::Mat filtered(mask.size(), CV_8UC1, cv::Scalar(0));
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+
+        if (area < 3 || area > 320) {
+            continue;
+        }
+        if (width < 1 || height < 3 || width > 36 || height > 52) {
+            continue;
+        }
+
+        const int major = std::max(width, height);
+        const int minor = std::max(1, std::min(width, height));
+        const double elongation = static_cast<double>(major) / static_cast<double>(minor);
+        if (elongation < 1.15) {
+            continue;
+        }
+
+        cv::Mat component_mask = labels == label;
+        filtered.setTo(255, component_mask);
+    }
+
+    return filtered;
+}
+
+cv::Mat ValidateByDarkRing(
+    const cv::Mat& white_core,
+    const cv::Mat& dark_outline
+) {
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count =
+        cv::connectedComponentsWithStats(white_core, labels, stats, centroids, 8);
+
+    cv::Mat filtered(white_core.size(), CV_8UC1, cv::Scalar(0));
+    cv::Mat ring_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+
+    for (int label = 1; label < component_count; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        if (area < 6 || width < 2 || height < 6 || width > 56 || height > 72) {
+            continue;
+        }
+
+        cv::Mat component_mask = labels == label;
+        component_mask.convertTo(component_mask, CV_8UC1, 255);
+
+        cv::Mat outer_ring;
+        cv::dilate(component_mask, outer_ring, ring_kernel, cv::Point(-1, -1), 1);
+        cv::subtract(outer_ring, component_mask, outer_ring);
+
+        const int ring_pixels = cv::countNonZero(outer_ring);
+        if (ring_pixels == 0) {
+            continue;
+        }
+
+        cv::Mat dark_on_ring;
+        cv::bitwise_and(outer_ring, dark_outline, dark_on_ring);
+        const double dark_ratio =
+            static_cast<double>(cv::countNonZero(dark_on_ring)) / static_cast<double>(ring_pixels);
+        if (dark_ratio < 0.10) {
+            continue;
+        }
+
+        filtered.setTo(255, component_mask);
+    }
+
+    return filtered;
+}
+
+cv::Mat ExtractClosedStrokeSeed(const cv::Mat& white_candidates) {
+    cv::Mat contours_source = white_candidates.clone();
+    std::vector<std::vector<cv::Point>> contours;
+    std::vector<cv::Vec4i> hierarchy;
+    cv::findContours(
+        contours_source,
+        contours,
+        hierarchy,
+        cv::RETR_CCOMP,
+        cv::CHAIN_APPROX_SIMPLE
+    );
+
+    cv::Mat closed_seed(white_candidates.size(), CV_8UC1, cv::Scalar(0));
+    for (int index = 0; index < static_cast<int>(contours.size()); ++index) {
+        const double area = cv::contourArea(contours[index]);
+        if (area < 6.0 || area > 1200.0) {
+            continue;
+        }
+
+        const cv::Rect box = cv::boundingRect(contours[index]);
+        if (box.height < 6 || box.height > 56 || box.width < 2 || box.width > 72) {
+            continue;
+        }
+
+        cv::drawContours(
+            closed_seed,
+            contours,
+            index,
+            cv::Scalar(255),
+            cv::FILLED,
+            cv::LINE_8,
+            hierarchy
+        );
+    }
+
+    return closed_seed;
 }
 
 cv::Rect ExtractSubtitleBand(const cv::Mat& candidate_mask) {
@@ -130,21 +340,25 @@ cv::Rect ExtractSubtitleBand(const cv::Mat& candidate_mask) {
     return cv::Rect(x, y, width, height);
 }
 
-cv::Mat ExtractCharacterMask(
+void ExtractCharacterMask(
     const cv::Mat& gray,
     const cv::Mat& low_saturation,
     const cv::Mat& bright_value,
     const cv::Mat& dark_value,
-    const cv::Rect& band_box
+    const cv::Rect& band_box,
+    int repair_expand,
+    cv::Mat& outline_mask_out,
+    cv::Mat& repair_mask_out
 ) {
-    cv::Mat result(gray.size(), CV_8UC1, cv::Scalar(0));
+    outline_mask_out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
+    repair_mask_out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
     if (band_box.empty()) {
-        return result;
+        return;
     }
 
     const cv::Rect clipped = band_box & cv::Rect(0, 0, gray.cols, gray.rows);
     if (clipped.empty()) {
-        return result;
+        return;
     }
 
     cv::Mat band_gray = gray(clipped);
@@ -152,17 +366,30 @@ cv::Mat ExtractCharacterMask(
     cv::Mat band_bright = bright_value(clipped);
     cv::Mat band_dark = dark_value(clipped);
 
+    cv::Mat local_background;
+    cv::GaussianBlur(band_gray, local_background, cv::Size(0, 0), 5.0);
+
+    cv::Mat local_contrast16;
+    cv::subtract(band_gray, local_background, local_contrast16, cv::noArray(), CV_16S);
+
+    cv::Mat local_contrast;
+    cv::convertScaleAbs(local_contrast16, local_contrast);
+
     cv::Mat strong_white;
     cv::inRange(band_gray, 150, 255, strong_white);
     cv::bitwise_and(strong_white, band_sat, strong_white);
 
     cv::Mat soft_white;
-    cv::inRange(band_gray, 120, 255, soft_white);
+    cv::inRange(band_gray, 132, 255, soft_white);
     cv::bitwise_and(soft_white, band_sat, soft_white);
 
-    cv::Mat gray_white;
-    cv::inRange(band_gray, 105, 210, gray_white);
-    cv::bitwise_and(gray_white, band_sat, gray_white);
+    cv::Mat weak_white;
+    cv::inRange(band_gray, 110, 235, weak_white);
+    cv::bitwise_and(weak_white, band_sat, weak_white);
+
+    cv::Mat contrast_white;
+    cv::threshold(local_contrast, contrast_white, 12, 255, cv::THRESH_BINARY);
+    cv::bitwise_and(contrast_white, band_sat, contrast_white);
 
     cv::Mat dark_outline;
     cv::adaptiveThreshold(
@@ -178,48 +405,66 @@ cv::Mat ExtractCharacterMask(
 
     cv::Mat stroke_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
     cv::morphologyEx(strong_white, strong_white, cv::MORPH_CLOSE, stroke_kernel);
+    cv::morphologyEx(soft_white, soft_white, cv::MORPH_CLOSE, stroke_kernel);
+    cv::morphologyEx(weak_white, weak_white, cv::MORPH_OPEN, stroke_kernel);
 
-    cv::Mat outline_neighbor;
-    cv::dilate(dark_outline, outline_neighbor, stroke_kernel, cv::Point(-1, -1), 1);
-
-    cv::Mat edge_seed;
-    cv::bitwise_and(gray_white, outline_neighbor, edge_seed);
-    cv::morphologyEx(edge_seed, edge_seed, cv::MORPH_OPEN, stroke_kernel);
-
-    cv::Mat soft_candidate;
-    cv::bitwise_and(soft_white, outline_neighbor, soft_candidate);
-    cv::bitwise_or(soft_candidate, edge_seed, soft_candidate);
-    cv::bitwise_or(soft_candidate, strong_white, soft_candidate);
-
-    cv::Mat combined_seed;
-    cv::bitwise_or(strong_white, edge_seed, combined_seed);
-    cv::Mat grown_white = GrowFromSeed(combined_seed, soft_candidate, 4);
-    cv::Mat filled_white = FillClosedRegions(grown_white);
-    cv::Mat bridge_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::morphologyEx(filled_white, filled_white, cv::MORPH_CLOSE, bridge_kernel);
-
-    cv::Mat sentence_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 3));
-    cv::Mat sentence_mask;
-    cv::morphologyEx(filled_white, sentence_mask, cv::MORPH_CLOSE, sentence_kernel);
-    sentence_mask = RemoveSmallComponents(sentence_mask, 24);
-    if (cv::countNonZero(sentence_mask) == 0) {
-        return result;
+    cv::Mat white_core = strong_white.clone();
+    cv::bitwise_or(white_core, soft_white, white_core);
+    white_core = RemoveSmallComponents(white_core, 3);
+    white_core = FilterStrokeLikeComponents(white_core);
+    white_core = ValidateByDarkRing(white_core, dark_outline);
+    if (cv::countNonZero(white_core) == 0) {
+        return;
     }
 
-    cv::Mat filtered_fill;
-    cv::bitwise_and(filled_white, sentence_mask, filtered_fill);
-    filtered_fill = RemoveSmallComponents(filtered_fill, 10);
-    cv::morphologyEx(filtered_fill, filtered_fill, cv::MORPH_CLOSE, bridge_kernel);
-    cv::Mat thin_outline = ExtractThinOutline(filtered_fill);
-    thin_outline.copyTo(result(clipped));
-    return result;
+    cv::Mat stroke_candidate = soft_white.clone();
+    cv::bitwise_or(stroke_candidate, strong_white, stroke_candidate);
+    cv::Mat weak_candidate;
+    cv::bitwise_and(weak_white, contrast_white, weak_candidate);
+    cv::bitwise_or(stroke_candidate, weak_candidate, stroke_candidate);
+    stroke_candidate = RemoveSmallComponents(stroke_candidate, 3);
+    cv::Mat grown_white = GrowFromSeed(white_core, stroke_candidate, 3);
+    cv::Mat candidate_islands = MergeStrokeClusters(grown_white);
+    candidate_islands = FilterCharacterIslands(candidate_islands);
+    if (cv::countNonZero(candidate_islands) == 0) {
+        return;
+    }
+
+    cv::Mat contour_mask = ExtractContourMask(candidate_islands, 10, 2);
+    if (cv::countNonZero(contour_mask) == 0) {
+        return;
+    }
+
+    cv::Mat repair_fill = FillClosedRegions(contour_mask);
+    cv::Mat repair_kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    if (repair_expand > 0) {
+        const int kernel_size = std::max(3, repair_expand | 1);
+        cv::Mat expand_kernel = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(kernel_size, kernel_size)
+        );
+        const int iterations = 1;
+        cv::dilate(repair_fill, repair_fill, expand_kernel, cv::Point(-1, -1), iterations);
+        cv::morphologyEx(repair_fill, repair_fill, cv::MORPH_CLOSE, expand_kernel);
+    }
+    repair_fill = FillClosedRegions(repair_fill);
+    cv::morphologyEx(repair_fill, repair_fill, cv::MORPH_CLOSE, repair_kernel);
+    repair_fill.copyTo(repair_mask_out(clipped));
+
+    contour_mask.copyTo(outline_mask_out(clipped));
 }
 
 }  // namespace
 
-DetectionResult DetectSubtitleMask(const cv::Mat& frame, const cv::Rect& roi_rect) {
+DetectionResult DetectSubtitleMask(
+    const cv::Mat& frame,
+    const cv::Rect& roi_rect,
+    int repair_expand
+) {
     DetectionResult result;
     result.mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
+    result.repair_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
+    result.expanded_outline_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
     result.band_mask = cv::Mat(frame.size(), CV_8UC1, cv::Scalar(0));
 
     cv::Mat roi = frame(roi_rect);
@@ -279,15 +524,22 @@ DetectionResult DetectSubtitleMask(const cv::Mat& frame, const cv::Rect& roi_rec
         ));
     }
 
-    const cv::Mat fine_mask = ExtractCharacterMask(
+    cv::Mat local_outline_mask;
+    cv::Mat local_repair_mask;
+    ExtractCharacterMask(
         gray,
         low_saturation,
         bright_value,
         dark_value,
-        band_box
+        band_box,
+        repair_expand,
+        local_outline_mask,
+        local_repair_mask
     );
-
-    fine_mask.copyTo(result.mask(roi_rect));
+    local_outline_mask.copyTo(result.mask(roi_rect));
+    local_repair_mask.copyTo(result.repair_mask(roi_rect));
+    cv::Mat expanded_outline = ExtractContourMask(local_repair_mask, 10, 2);
+    expanded_outline.copyTo(result.expanded_outline_mask(roi_rect));
     result.masked_pixels = cv::countNonZero(result.mask);
     return result;
 }

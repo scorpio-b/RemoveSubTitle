@@ -15,6 +15,7 @@ struct Options {
     int height = 220;
     int temporal_window = 12;
     int patch_radius = 2;
+    int repair_expand = 5;
     std::size_t thread_count = 0;
 };
 

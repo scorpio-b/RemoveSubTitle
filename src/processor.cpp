@@ -67,13 +67,18 @@ void ParallelFor(std::size_t item_count, std::size_t thread_count, Fn&& fn) {
 
 std::vector<cv::Mat> StabilizeMasksTemporally(
     const std::vector<DetectionResult>& detections,
+    const std::vector<cv::Mat>& source_masks,
     const cv::Rect& roi_rect
 ) {
+    (void)detections;
+    (void)roi_rect;
+    return source_masks;
+
     std::vector<cv::Mat> stabilized_masks;
     stabilized_masks.reserve(detections.size());
 
     for (int index = 0; index < static_cast<int>(detections.size()); ++index) {
-        cv::Mat stabilized = detections[index].mask.clone();
+        cv::Mat stabilized = source_masks[index].clone();
         if (cv::countNonZero(stabilized) == 0) {
             stabilized_masks.push_back(stabilized);
             continue;
@@ -85,21 +90,31 @@ std::vector<cv::Mat> StabilizeMasksTemporally(
         for (int offset = 1; offset <= 2; ++offset) {
             const int prev = index - offset;
             if (prev >= 0) {
-                cv::Mat overlap;
-                cv::bitwise_and(detections[index].band_mask, detections[prev].mask, overlap);
-                if (cv::countNonZero(overlap) > 0) {
-                    cv::bitwise_or(support, overlap, support);
-                    ++supporting_neighbors;
+                if (!detections[index].band_mask.empty() &&
+                    !source_masks[prev].empty() &&
+                    detections[index].band_mask.size() == source_masks[prev].size() &&
+                    detections[index].band_mask.type() == source_masks[prev].type()) {
+                    cv::Mat overlap;
+                    cv::bitwise_and(detections[index].band_mask, source_masks[prev], overlap);
+                    if (cv::countNonZero(overlap) > 0) {
+                        cv::bitwise_or(support, overlap, support);
+                        ++supporting_neighbors;
+                    }
                 }
             }
 
             const int next = index + offset;
             if (next < static_cast<int>(detections.size())) {
-                cv::Mat overlap;
-                cv::bitwise_and(detections[index].band_mask, detections[next].mask, overlap);
-                if (cv::countNonZero(overlap) > 0) {
-                    cv::bitwise_or(support, overlap, support);
-                    ++supporting_neighbors;
+                if (!detections[index].band_mask.empty() &&
+                    !source_masks[next].empty() &&
+                    detections[index].band_mask.size() == source_masks[next].size() &&
+                    detections[index].band_mask.type() == source_masks[next].type()) {
+                    cv::Mat overlap;
+                    cv::bitwise_and(detections[index].band_mask, source_masks[next], overlap);
+                    if (cv::countNonZero(overlap) > 0) {
+                        cv::bitwise_or(support, overlap, support);
+                        ++supporting_neighbors;
+                    }
                 }
             }
         }
@@ -177,8 +192,12 @@ int ProcessVideo(const Options& options) {
     LogLine("Stage: detect subtitle masks");
     std::atomic<std::size_t> detected_count{0};
     ParallelFor(frames.size(), options.thread_count, [&](std::size_t index) {
-        DetectionResult detection = DetectSubtitleMask(frames[index], roi_rect);
-        masks[index] = detection.mask;
+        DetectionResult detection = DetectSubtitleMask(
+            frames[index],
+            roi_rect,
+            options.repair_expand
+        );
+        masks[index] = detection.repair_mask;
         detections[index] = std::move(detection);
 
         const std::size_t done = detected_count.fetch_add(1) + 1;
@@ -188,7 +207,7 @@ int ProcessVideo(const Options& options) {
     });
 
     LogLine("Stage: stabilize masks");
-    masks = StabilizeMasksTemporally(detections, roi_rect);
+    masks = StabilizeMasksTemporally(detections, masks, roi_rect);
 
     int subtitle_frames = 0;
     if (write_debug) {
@@ -202,13 +221,35 @@ int ProcessVideo(const Options& options) {
                 cv::rectangle(overlay, box, cv::Scalar(0, 255, 0), 2);
             }
 
-            cv::Mat red_fill = overlay.clone();
-            red_fill.setTo(cv::Scalar(0, 0, 255), masks[index]);
-            cv::addWeighted(red_fill, 0.35, overlay, 0.65, 0.0, overlay);
+            if (!masks[index].empty() &&
+                masks[index].size() == overlay.size() &&
+                masks[index].type() == CV_8UC1) {
+                cv::Mat red_fill = overlay.clone();
+                red_fill.setTo(cv::Scalar(0, 0, 255), masks[index]);
+                cv::addWeighted(red_fill, 0.35, overlay, 0.65, 0.0, overlay);
 
-            std::vector<std::vector<cv::Point>> contours;
-            cv::findContours(masks[index], contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-            cv::drawContours(overlay, contours, -1, cv::Scalar(0, 0, 255), 2);
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(
+                    masks[index],
+                    contours,
+                    cv::RETR_EXTERNAL,
+                    cv::CHAIN_APPROX_SIMPLE
+                );
+                cv::drawContours(overlay, contours, -1, cv::Scalar(0, 0, 255), 2);
+            }
+
+            if (!detections[index].expanded_outline_mask.empty() &&
+                detections[index].expanded_outline_mask.size() == overlay.size() &&
+                detections[index].expanded_outline_mask.type() == CV_8UC1) {
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(
+                    detections[index].expanded_outline_mask,
+                    contours,
+                    cv::RETR_EXTERNAL,
+                    cv::CHAIN_APPROX_SIMPLE
+                );
+                cv::drawContours(overlay, contours, -1, cv::Scalar(0, 255, 255), 2);
+            }
 
             std::ostringstream name;
             name << "mask_" << std::setw(4) << std::setfill('0') << index << ".jpg";
@@ -258,6 +299,7 @@ int ProcessVideo(const Options& options) {
               << roi_rect.width << "," << roi_rect.height << '\n';
     std::cout << "Frames with subtitle mask: " << subtitle_frames << "/" << frames.size() << '\n';
     std::cout << "Thread count: " << options.thread_count << '\n';
+    std::cout << "Repair expand: " << options.repair_expand << '\n';
     if (write_debug) {
         std::cout << "Debug frames written to: " << options.debug_dir << '\n';
     }
